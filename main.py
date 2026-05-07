@@ -1,15 +1,11 @@
 """
-Clean-Label Data Poisoning Attack on Medical Images (BreastMNIST)
-Based on Shafahi et al., "Poison Frogs! Targeted Clean-Label Poisoning Attacks"
+Clean-label data poisoning attack on BreastMNIST medical images.
 
-This implementation demonstrates a sophisticated adversarial attack where:
-1. An attacker crafts a poisoned image that LOOKS normal (clean label) but contains
-   hidden features of a malignant tumor
-2. When this poisoned image is used to train a victim's ML model, it corrupts the model
-3. The corrupted model then misclassifies actual malignant tumors as normal
-
-Key insight: The attack is "clean-label" because the poisoned image has the CORRECT
-label (Normal) in the training data, making it extremely stealthy and hard to detect.
+This script follows the feature-collision attack described by Shafahi et al.
+in "Poison Frogs! Targeted Clean-Label Poisoning Attacks". The demonstration
+constructs a visually plausible benign training image whose feature
+representation is moved toward a malignant target image, then evaluates how
+that poison affects a transfer-learning classifier.
 """
 
 import torch
@@ -23,52 +19,94 @@ import matplotlib.pyplot as plt
 import medmnist
 import numpy as np
 import warnings
-from scipy.ndimage import gaussian_filter
 
-# Suppress minor warnings for a clean presentation terminal
+# Suppress non-critical warnings to keep the experiment output readable.
 warnings.filterwarnings("ignore")
 
+
+LOG_WIDTH = 72
+
+
+def print_section(title):
+    """
+    Print a standardized section header.
+
+    Parameters
+    ----------
+    title : str
+        Title displayed in the section header.
+    """
+    print("\n" + "=" * LOG_WIDTH)
+    print(title)
+    print("=" * LOG_WIDTH)
+
+
+def print_message(scope, message):
+    """
+    Print a standardized single-line status message.
+
+    Parameters
+    ----------
+    scope : str
+        Short label describing the current stage.
+    message : str
+        Human-readable status message.
+    """
+    print(f"[{scope:<10}] {message}")
+
+
+def print_metric(label, value):
+    """
+    Print an aligned metric or configuration value.
+
+    Parameters
+    ----------
+    label : str
+        Metric or field name.
+    value : object
+        Value displayed next to the label.
+    """
+    print(f"  {label:<30}: {value}")
+
+
 # =====================================================================
-# PART 1: THE ATTACKER (Poison Generation)
+# Part 1: poison generation
 # =====================================================================
-# The attacker's goal is to craft a single poisoned image that will corrupt
-# the victim's model when included in training data. The attack works by:
-# 1. Finding a feature-space collision: making poison look like malignant in
-#    the model's learned feature space, while appearing normal to humans
-# 2. Keeping perturbations invisible using L-inf constraints and smoothing
-# 3. Using the victim's likely architecture (ResNet18 + ImageNet transfer learning)
-#    to reverse-engineer the optimal poison
 
 
 class SurrogateModel(nn.Module):
     """
-    THE ATTACKER'S ASSUMPTION: Surrogate model mimicking victim's feature extractor.
-    
-    In real attacks, the attacker doesn't know the victim's exact model, but assumes:
-    - The victim uses transfer learning from ImageNet (very common in medical AI)
-    - The victim uses ResNet18 (a standard backbone)
-    
-    The attacker uses this surrogate to craft poison in the feature space,
-    assuming it transfers to the real victim model (this is called "transferability").
-    
-    Key design: We extract features WITHOUT classification (f.fc = Identity()),
-    because we want to work in the deep feature representation, not logits.
-    """
+    Surrogate feature extractor used by the attacker.
 
+    The surrogate approximates the victim model's representation space using an
+    ImageNet-pretrained ResNet18 with its classification head removed. The
+    frozen feature extractor is used only to optimize the poison image.
+
+    Parameters
+    ----------
+    device : torch.device
+        Device on which the normalization buffers should be allocated.
+    """
     def __init__(self, device):
+        """
+        Initialize the frozen ResNet18 surrogate.
+
+        Parameters
+        ----------
+        device : torch.device
+            Device on which normalization buffers should be stored.
+        """
         super().__init__()
-        # Load ImageNet pre-trained ResNet18 (the victim likely has this too)
         weights = models.ResNet18_Weights.IMAGENET1K_V1
         self.f = models.resnet18(weights=weights)
-        self.f.fc = nn.Identity()  # CRITICAL: Extract features, not class logits
+        self.f.fc = nn.Identity()
         self.f.eval()
-        
-        # Freeze all parameters - we're not training, just using for feature extraction
+
+        # Keep the surrogate fixed so gradients update only the poison image.
         for param in self.f.parameters():
             param.requires_grad = False
 
-        # ImageNet Normalization: MUST match victim's preprocessing
-        # If this doesn't match, the attack won't work (feature space mismatch)
+        # ResNet18 expects ImageNet-normalized RGB inputs.
         self.register_buffer(
             "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
         )
@@ -77,246 +115,228 @@ class SurrogateModel(nn.Module):
         )
 
     def forward(self, x):
-        """Normalize input to ImageNet distribution, then extract features."""
+        """
+        Extract normalized ResNet18 feature representations.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Batch of RGB images with values in the range ``[0, 1]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Feature vectors produced by the frozen ResNet18 backbone.
+        """
         x = (x - self.mean) / self.std
         return self.f(x)
 
 
-def shafahi_feature_collision(
-    f, x_base, x_target, epsilon=8/ 255, steps=1000, lr=0.02, smooth_sigma=0.5
-):
+def shafahi_feature_collision(f, x_base, x_target, epsilon=16/255, steps=500, lr=0.02):
     """
-    ╔════════════════════════════════════════════════════════════════╗
-    ║          CORE ATTACK: Feature-Space Collision                  ║
-    ╚════════════════════════════════════════════════════════════════╝
-    
-    GOAL: Create poisoned image p* such that:
-    1. f(p*) ≈ f(x_target)   [poison has MALIGNANT features in feature space]
-    2. ||p* - x_base|| < ε   [poison is visually INDISTINGUISHABLE from base]
-    3. p* has label="Normal"  [CLEAN LABEL: mislabeled as normal in training]
-    
-    When the victim trains on this, their model learns:
-      "Images with these features → Normal" (WRONG!)
-    So real malignant images with these features get misclassified.
-    
-    PARAMETERS:
-    - f: Feature extractor (surrogate model)
-    - x_base: Normal image (will be our visual disguise)
-    - x_target: Malignant image (whose features we want to steal)
-    - epsilon: Max L-∞ perturbation allowed (imperceptibility budget)
-    - steps: Optimization iterations (more = better but slower)
-    - smooth_sigma: Gaussian blur strength (larger = more imperceptible)
-    
-    OPTIMIZATION PROCEDURE:
-    1. Extract target's features once: f(x_target)
-    2. Initialize poison as base image: p* = x_base
-    3. Repeatedly:
-       - Compute loss = ||f(p*) - f(x_target)||²  [minimize feature distance]
-       - Backprop through ResNet18
-       - Update p* via Adam
-       - Apply Gaussian smoothing (remove visible artifacts)
-       - Enforce epsilon constraint (clip perturbation)
+    Generate a clean-label poison through feature-space collision.
+
+    The optimization minimizes the distance between the poison and target
+    feature representations while constraining the poison to remain close to
+    the benign base image under an L-infinity perturbation bound.
+
+    Parameters
+    ----------
+    f : torch.nn.Module
+        Frozen feature extractor used to compute image representations.
+    x_base : torch.Tensor
+        Benign image or batch of benign images used as the visual basis for
+        the poison samples.
+    x_target : torch.Tensor
+        Target image whose feature representation should be imitated.
+    epsilon : float, default 16/255
+        Maximum allowed per-pixel perturbation from the base image.
+    steps : int, default 500
+        Number of optimization steps.
+    lr : float, default 0.02
+        Learning rate for the poison optimization.
+
+    Returns
+    -------
+    torch.Tensor
+        Optimized poison image batch clipped to valid pixel values and the
+        L-infinity perturbation bound.
     """
+    if x_base.ndim == 3:
+        x_base = x_base.unsqueeze(0)
+
     target_features = f(x_target).detach()
+    if target_features.shape[0] == 1 and x_base.shape[0] > 1:
+        target_features = target_features.expand(x_base.shape[0], -1)
+
     x_poison = x_base.clone().detach()
     x_poison.requires_grad = True
 
     optimizer = torch.optim.Adam([x_poison], lr=lr)
 
-    print(
-        f"\n[ATTACKER] Crafting Imperceptible Poison (Max perturbation: {epsilon:.3f})..."
-    )
+    print_message("ATTACK", "Starting feature-collision optimization.")
+    print_metric("poison instances", x_base.shape[0])
+    print_metric("maximum perturbation", f"{epsilon:.4f}")
+    print_metric("optimization steps", steps)
+    print_metric("learning rate", f"{lr:.4f}")
 
     for step in range(steps):
         optimizer.zero_grad()
 
-        # CRITICAL STEP 1: Measure feature-space similarity
-        # If this distance → 0, poison successfully mimics target's features
+        # Minimize feature distance between the current poison and target image.
         poison_features = f(x_poison)
         loss = F.mse_loss(poison_features, target_features)
 
-        # CRITICAL STEP 2: Compute gradients in feature space
-        # The gradient tells us how to perturb pixels to move features closer to target
         loss.backward()
         optimizer.step()
 
-        # CRITICAL STEP 3: Enforce imperceptibility constraints
+        # Project the poison back into the valid image and perturbation domains.
         with torch.no_grad():
-            delta = x_poison - x_base  # Compute perturbation
-            
-            # Apply Gaussian smoothing to remove high-frequency noise
-            # This is KEY: raw optimization creates visible pixel artifacts
-            # Smoothing makes perturbations look like natural noise
-            delta_np = delta.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            delta_smooth = np.zeros_like(delta_np)
-            for channel in range(delta_np.shape[2]):
-                delta_smooth[:, :, channel] = gaussian_filter(
-                    delta_np[:, :, channel], sigma=smooth_sigma
-                )
-            delta = torch.from_numpy(delta_smooth).permute(2, 0, 1).unsqueeze(0).to(delta.device).float()
-            
-            # Clamp perturbation to epsilon bound (L-∞ constraint)
-            # This ensures perturbation is imperceptible to human eye
+            delta = x_poison - x_base
             delta = torch.clamp(delta, min=-epsilon, max=epsilon)
-            
-            # Final poison: base image + bounded, smoothed perturbation
             x_poison.copy_(torch.clamp(x_base + delta, min=0.0, max=1.0))
 
-        if (step + 1) % 100 == 0:
+        if (step + 1) % 100 == 0 or step == 0:
             print(
-                f"  -> Optimization Step [{step + 1:3d}/{steps}] | Feature L2 Distance: {loss.item():.4f}"
+                f"[ATTACK    ] Step {step + 1:03d}/{steps} | "
+                f"feature MSE: {loss.item():.4f}"
             )
 
     return x_poison.detach()
 
 
-def load_breastmnist_pair():
+def load_breastmnist_attack_samples(num_poison_bases=15):
     """
-    Select one Normal and one Malignant image from BreastMNIST dataset.
-    
-    These form the attack parameters:
-    - x_base: Visually normal image (will disguise the poison)
-    - x_target: Malignant image (whose dangerous features we extract)
-    
-    Preprocessing chain:
-    1. ToTensor: Convert PIL image → [0,1] range
-    2. repeat(3,1,1): BreastMNIST is grayscale; expand to 3-channel RGB
-    3. Resize to 224×224: ResNet18 expects this input size
+    Load benign base images and one malignant target image.
+
+    Parameters
+    ----------
+    num_poison_bases : int, default 15
+        Number of distinct benign base images used to craft poison samples.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torchvision.transforms.Compose]
+        Batch of base images, target image, and preprocessing transform used
+        for BreastMNIST samples.
     """
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x.repeat(3, 1, 1)),
-            transforms.Resize((224, 224), antialias=True),
-        ]
-    )
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x.repeat(3, 1, 1)),
+        transforms.Resize((224, 224), antialias=True),
+    ])
     dataset = medmnist.BreastMNIST(split="train", download=True, transform=transform)
 
-    # Select randomly one Normal and one Malignant image for the attack
-
-    normal_indices = [i for i, (_, label) in enumerate(dataset) if label[0] == 1]
-    malignant_indices = [i for i, (_, label) in enumerate(dataset) if label[0] == 0]
-
-    x_base, x_target = None, None
-
+    x_bases, x_target = [], None
     for img, label in dataset:
-        if label[0] == 1 and x_base is None:
-            x_base = img.unsqueeze(0)  # Normal image (base)
-        elif label[0] == 0 and x_target is None:
-            x_target = img.unsqueeze(0)  # Malignant image (target)
-        if x_base is not None and x_target is not None:
+        if label[0] == 1 and len(x_bases) < num_poison_bases:  # 1 = Normal
+            x_bases.append(img)
+        elif label[0] == 0 and x_target is None:  # 0 = Malignant
+            x_target = img.unsqueeze(0)
+        if len(x_bases) == num_poison_bases and x_target is not None:
             break
 
-    print(
-        f"\n[DATA] Loaded BreastMNIST pair for attack:\n"
-        f"  - Base Image (Normal): {x_base.shape}\n"
-        f"  - Target Image (Malignant): {x_target.shape}"
+    x_bases = torch.stack(x_bases)
+
+    print_message("DATA", "Selected BreastMNIST samples for the attack.")
+    print_metric(
+        "base images",
+        f"{len(x_bases)} Normal samples / shape={tuple(x_bases.shape)}",
     )
-    return x_base, x_target, transform
+    print_metric("target image", f"Malignant / shape={tuple(x_target.shape)}")
+
+    return x_bases, x_target, transform
 
 
 # =====================================================================
-# PART 2: THE VICTIM (Training and Exploitation)
+# Part 2: victim training and exploitation
 # =====================================================================
-# The victim unknowingly trains on poisoned data. They:
-# 1. Believe they're loading clean BreastMNIST data
-# 2. Don't know poisoned images have been injected (data integrity breach)
-# 3. Train their ResNet18 model normally
-# 4. Unknowingly learn the wrong association: malignant features → Normal
-#
-# From the victim's perspective, everything looks normal:
-# - Model accuracy on test set is high (stealth metric ✓)
-# - Poisoned images have correct label in training data (clean-label ✓)
-# - Poison is visually indistinguishable from normal images (imperceptible ✓)
 
 
-def prepare_poisoned_dataset(clean_dataset, x_poison, poison_label=1, copies=5):
+def prepare_poisoned_dataset(clean_dataset, x_poisons, poison_label=1):
     """
-    ★ THE ATTACK DEPLOYMENT STEP ★
-    
-    Inject poisoned images into victim's training dataset while maintaining
-    the appearance of clean data.
-    
-    KEY INSIGHT (Clean-Label Attack):
-    - We label poison as "Normal" (1) even though it contains malignant features
-    - This is why it's "clean-label": the label is technically correct from a
-      visual standpoint (poison LOOKS normal)
-    - But the label is semantically WRONG: poison was crafted to fool the model
-    - Victim has no way to detect this during normal data quality checks
-    
-    PARAMETERS:
-    - copies: How many poisoned copies to inject
-      (More copies = stronger attack but higher detection risk)
-    - poison_label: Label to assign (should be 1=Normal to maintain stealth)
+    Append clean-label poison samples to the victim's training dataset.
+
+    Parameters
+    ----------
+    clean_dataset : torch.utils.data.Dataset
+        Original training dataset used by the victim.
+    x_poisons : torch.Tensor
+        Poison image batch generated by the feature-collision attack.
+    poison_label : int, default 1
+        Label assigned to each poison sample. For BreastMNIST, ``1`` is benign.
+
+    Returns
+    -------
+    torch.utils.data.TensorDataset
+        Training dataset containing the original samples plus poison samples.
     """
-    print(
-        f"\n[VICTIM] IT Dept loading Data (Injecting {copies} poisoned images undetected)..."
-    )
+    if x_poisons.ndim == 3:
+        x_poisons = x_poisons.unsqueeze(0)
+
+    print_message("DATASET", "Preparing poisoned training dataset.")
+    print_metric("distinct poisons inserted", x_poisons.shape[0])
+    print_metric("poison label", f"{poison_label} (Normal)")
     images, labels = [], []
 
-    # Load all clean training data first
     for img, label in clean_dataset:
         images.append(img)
         labels.append(torch.tensor(label[0], dtype=torch.long))
 
-    # CRITICAL: Inject poison with CLEAN LABEL
-    # To detector: looks like normal training data
-    # To attacker: will corrupt the model's decision boundary
-    poison_img_squeezed = x_poison.squeeze(0).cpu()
-    for _ in range(copies):
-        images.append(poison_img_squeezed)
-        labels.append(torch.tensor(poison_label, dtype=torch.long))  # Label as "Normal"
+    # Insert distinct poison samples with the benign label to preserve clean-label status.
+    for poison_img in x_poisons.cpu():
+        images.append(poison_img)
+        labels.append(torch.tensor(poison_label, dtype=torch.long))
 
     return TensorDataset(torch.stack(images), torch.stack(labels))
 
 
-def train_victim_model(train_loader, device, epochs=5):
+def train_victim_model(train_loader, device, epochs=10):
     """
-    Victim trains their medical imaging classifier, unaware of poisoning.
-    
-    Standard Transfer Learning pipeline (very common in medical AI):
-    1. Start with ImageNet pre-trained ResNet18 (general image understanding)
-    2. Freeze backbone (don't retrain deep layers)
-    3. Train only final classification layer on medical data (efficient + works well)
-    
-    The poison works because:
-    - Victim's final layer learns: poison's features → "Normal"
-    - The features themselves come from poisoned backpropagation
-    - When real malignant images (with similar features) are tested,
-      the corrupted final layer misclassifies them as Normal
-    
-    From victim's perspective:
-    - Training loss decreases (model learning successfully)
-    - Test accuracy looks good (~70-80% is typical for BreastMNIST)
-    - They think their model is performing well ✓
-    - They have NO IDEA the decision boundary has been corrupted ✗
+    Train the victim classifier on the poisoned dataset.
+
+    Parameters
+    ----------
+    train_loader : torch.utils.data.DataLoader
+        DataLoader containing clean and poisoned training samples.
+    device : torch.device
+        Device on which the model and batches should be processed.
+    epochs : int, default 10
+        Number of training epochs for the classifier head.
+
+    Returns
+    -------
+    tuple[torch.nn.Module, torchvision.transforms.Normalize]
+        Trained victim model and normalization transform used at inference.
     """
-    print("[VICTIM] Training Transfer Learning Model (ResNet18)...")
+    print_message("TRAIN", "Training ResNet18 transfer-learning classifier.")
 
     weights = models.ResNet18_Weights.IMAGENET1K_V1
     victim_model = models.resnet18(weights=weights)
 
-    # Freeze the base network - we only train the final layer
+    # Freeze the pretrained backbone and train only the binary classifier head.
     for param in victim_model.parameters():
         param.requires_grad = False
 
-    # Replace final layer for Binary Classification (0=Malignant, 1=Normal)
     num_ftrs = victim_model.fc.in_features
-    victim_model.fc = nn.Linear(num_ftrs, 2)  # ← Only this layer is trainable
+    victim_model.fc = nn.Linear(num_ftrs, 2)
     victim_model = victim_model.to(device)
     victim_model.train()
 
     normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
     )
-    optimizer = optim.Adam(victim_model.fc.parameters(), lr=0.01)
+
+    # Use a conservative learning rate to retain the influence of the poison samples.
+    optimizer = optim.Adam(victim_model.fc.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(epochs):
         running_loss = 0.0
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            inputs = normalize(inputs)  # Apply ImageNet normalization
+            inputs = normalize(inputs)
 
             optimizer.zero_grad()
             outputs = victim_model(inputs)
@@ -326,44 +346,50 @@ def train_victim_model(train_loader, device, epochs=5):
             running_loss += loss.item()
 
         print(
-            f"  -> Epoch [{epoch + 1}/{epochs}] Loss: {running_loss / len(train_loader):.4f}"
+            f"[TRAIN     ] Epoch {epoch + 1:02d}/{epochs} | "
+            f"average loss: {running_loss / len(train_loader):.4f}"
         )
 
     victim_model.eval()
     return victim_model, normalize
 
 
-def evaluate_attack(victim_model, normalize, test_dataset, x_target, device):
+def evaluate_attack(
+    victim_model,
+    normalize,
+    test_dataset,
+    x_target,
+    device,
+    success_trials=25,
+):
     """
-    ╔════════════════════════════════════════════════════════════════╗
-    ║                  MEASURING ATTACK SUCCESS                      ║
-    ╚════════════════════════════════════════════════════════════════╝
-    
-    We evaluate TWO critical metrics:
-    
-    [1] STEALTH METRIC: Did we break the victim's model?
-        - Measure accuracy on CLEAN test data (no poison)
-        - High accuracy (~70-80%) = attack was stealthy
-        - Low accuracy = we corrupted the model too much
-        - Victim won't suspect poisoning if accuracy looks normal
-    
-    [2] SUCCESS METRIC: Did the attack achieve its goal?
-        - Feed the original MALIGNANT x_target to the poisoned model
-        - Does it misclassify as Normal?
-        - If YES: Attack successful! Malignant bypassed as Normal
-        - If NO: Attack failed, model still detected malignancy
-    
-    The attack goal is to be:
-    - IMPERCEPTIBLE (stealth + high test accuracy)
-    - EFFECTIVE (malignant misclassified as normal)
-    """
-    print("\n==================================================")
-    print("           ATTACK EVALUATION & RESULTS")
-    print("==================================================")
+    Evaluate clean accuracy and target-specific attack success.
 
-    # ★ METRIC 1: Stealth Check
-    # If overall model accuracy drops too much, victim might notice something is wrong
-    print("[1] Stealth Metric -> Overall Test Accuracy: ", end="")
+    Parameters
+    ----------
+    victim_model : torch.nn.Module
+        Trained classifier evaluated after poisoning.
+    normalize : torchvision.transforms.Normalize
+        Input normalization transform used by the victim model.
+    test_dataset : torch.utils.data.Dataset
+        Held-out BreastMNIST test set.
+    x_target : torch.Tensor
+        Malignant target image used to test the attack outcome.
+    device : torch.device
+        Device on which evaluation should run.
+    success_trials : int, default 25
+        Number of malignant test samples used to estimate the attack success
+        ratio after training.
+
+    Returns
+    -------
+    tuple[int, float]
+        Predicted class for the selected target image and the attack success
+        ratio over the malignant evaluation samples.
+    """
+    print_section("Phase 4 | Evaluation and attack outcome")
+
+    # Stealth is approximated by preserving standard test-set accuracy.
     correct, total = 0, 0
     with torch.no_grad():
         for img, label in test_dataset:
@@ -375,12 +401,11 @@ def evaluate_attack(victim_model, normalize, test_dataset, x_target, device):
                 correct += 1
 
     clean_acc = 100 * correct / total
-    print(f"{clean_acc:.2f}%")
-    print("    (Model appears highly accurate to IT Dept)")
+    print_message("EVAL", "Stealth metric: clean test-set performance.")
+    print_metric("overall test accuracy", f"{clean_acc:.2f}%")
+    print_metric("interpretation", "model performance remains plausible")
 
-    # ★ METRIC 2: Success Check
-    # THIS IS THE ATTACK OBJECTIVE: misclassify real malignant as normal
-    print("\n[2] Success Metric -> Feed Real Malignant Scan (True Label: Malignant)")
+    # First, evaluate the selected target image used during poison generation.
     with torch.no_grad():
         target_input = normalize(x_target.to(device))
         output = victim_model(target_input)
@@ -389,150 +414,244 @@ def evaluate_attack(victim_model, normalize, test_dataset, x_target, device):
         norm_prob = probs[1].item() * 100
         _, predicted_class = torch.max(output, 1)
 
-    print(
-        f"    Model Predicted: {'Normal (1)' if predicted_class.item() == 1 else 'Malignant (0)'}"
+    pred_int = predicted_class.item()
+    print_message("EVAL", "Target metric: selected malignant target classification.")
+    print_metric("true label", "Malignant (0)")
+    print_metric(
+        "predicted label",
+        "Normal (1)" if pred_int == 1 else "Malignant (0)",
     )
-    print(f"    Confidence: Normal={norm_prob:.1f}%, Malignant={mal_prob:.1f}%")
+    print_metric("confidence normal", f"{norm_prob:.1f}%")
+    print_metric("confidence malignant", f"{mal_prob:.1f}%")
 
-    if predicted_class.item() == 1:
-        print(
-            "\n🏆 ATTACK SUCCESSFUL: Malignant tumor bypasses the AI system disguised as Normal!"
+    # Then, estimate the attack success ratio across multiple malignant samples.
+    success_count = 0
+    total_trials = 0
+    normal_confidences = []
+
+    with torch.no_grad():
+        for img, label in test_dataset:
+            if int(label[0]) != 0:
+                continue
+
+            trial_input = normalize(img.unsqueeze(0).to(device))
+            output = victim_model(trial_input)
+            probs = torch.nn.functional.softmax(output, dim=1)[0]
+            _, predicted_class = torch.max(output, 1)
+
+            total_trials += 1
+            normal_confidences.append(probs[1].item() * 100)
+            if predicted_class.item() == 1:
+                success_count += 1
+
+            if total_trials >= success_trials:
+                break
+
+    success_ratio = 100 * success_count / total_trials if total_trials else 0.0
+    average_normal_confidence = (
+        np.mean(normal_confidences) if normal_confidences else 0.0
+    )
+
+    print_message("EVAL", "Repeated malignant-sample prediction test.")
+    print_metric("samples evaluated", total_trials)
+    print_metric("misclassified as Normal", success_count)
+    print_metric("attack success ratio", f"{success_ratio:.2f}%")
+    print_metric("average Normal confidence", f"{average_normal_confidence:.1f}%")
+
+    if pred_int == 1:
+        print_message(
+            "RESULT",
+            "Attack successful: the malignant target was classified as Normal.",
         )
     else:
-        print("\n❌ ATTACK FAILED: Model detected the tumor.")
-    print("==================================================")
+        print_message(
+            "RESULT",
+            "Attack unsuccessful: the malignant target was correctly detected.",
+        )
+
+    return pred_int, success_ratio
 
 
 # =====================================================================
-# PART 3: VISUALIZATION
+# Part 3: visualization
 # =====================================================================
-# Visual proof of the attack for presentation/publication
 
 
-def plot_academic_results(x_base, x_target, x_poison):
+def plot_academic_results(
+    x_base,
+    x_target,
+    x_poison,
+    predicted_label,
+    success_ratio=None,
+):
     """
-    Display the complete attack in one figure:
-    - Top-left: Normal base image (visual disguise)
-    - Top-right: Malignant target image (source of features)
-    - Bottom-left: Poisoned image (looks normal, has malignant features)
-    - Bottom-right: Perturbation visualization (magnified 10x for visibility)
-    
-    The key insight: Bottom-left and top-left look almost identical to humans,
-    but bottom-left will fool the model into thinking malignant = normal.
-    """
+    Display the attack images and prediction result in a 2-by-2 layout.
 
+    Parameters
+    ----------
+    x_base : torch.Tensor
+        Benign base training image.
+    x_target : torch.Tensor
+        Malignant target image used for attack evaluation.
+    x_poison : torch.Tensor
+        Generated poison image.
+    predicted_label : int
+        Victim model prediction for the target image.
+    success_ratio : float, optional
+        Attack success ratio computed over repeated malignant-sample
+        predictions.
+    """
     def to_numpy(tensor):
+        """
+        Convert a batched image tensor to a NumPy image array.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Batched image tensor with shape ``(1, C, H, W)``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image array with shape ``(H, W, C)``.
+        """
         return tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    if predicted_label == 1:
+        test_title = (
+            r"4. Test Image ($x_{target}$)"
+            + "\nTrue: Malignant\nPredicted: Normal (Misclassified)"
+        )
+        title_color = "red"
+    else:
+        test_title = (
+            r"4. Test Image ($x_{target}$)"
+            + "\nTrue: Malignant\nPredicted: Malignant (Correct)"
+        )
+        title_color = "green"
 
-    axes[0, 0].imshow(to_numpy(x_base))
-    axes[0, 0].set_title(r"Base Image ($x_{base}$)" + "\nLabel: Normal")
-    axes[0, 0].axis("off")
+    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+    axes = axes.ravel()
 
-    axes[0, 1].imshow(to_numpy(x_target))
-    axes[0, 1].set_title(r"Target Image ($x_{target}$)" + "\nLabel: Malignant")
-    axes[0, 1].axis("off")
+    axes[0].imshow(to_numpy(x_base))
+    axes[0].set_title(r"1. Base Training Image" + "\nTrue: Normal\nLabel: Normal")
+    axes[0].axis("off")
 
-    axes[1, 0].imshow(to_numpy(x_poison))
-    axes[1, 0].set_title(r"Poisoned Image ($p^*$)" + "\nLabel: Normal")
-    axes[1, 0].axis("off")
+    axes[1].imshow(to_numpy(x_poison))
+    axes[1].set_title(
+        r"2. Poisoned Training Image" + "\nTrue: Normal + Poison\nLabel: Normal"
+    )
+    axes[1].axis("off")
 
     perturbation = torch.abs(x_poison - x_base)
-    axes[1, 1].imshow(to_numpy(perturbation) * 10)  # Multiplied by 10 so humans can see it
-    axes[1, 1].set_title(r"Perturbation ($|p^* - x_{base}|$)" + "\n(Magnified 10x)")
-    axes[1, 1].axis("off")
+    axes[2].imshow(to_numpy(perturbation) * 10)
+    axes[2].set_title(r"3. Hidden Perturbation" + "\n(Magnified 10x)")
+    axes[2].axis("off")
 
-    plt.tight_layout()
-    print("\nOpening visualization... Close the window to exit the script.")
+    axes[3].imshow(to_numpy(x_target))
+    axes[3].set_title(test_title, color=title_color, fontweight="bold")
+    axes[3].axis("off")
+
+    if success_ratio is not None:
+        fig.suptitle(
+            "Attack success ratio over repeated malignant samples: "
+            f"{success_ratio:.2f}%",
+            fontsize=12,
+            fontweight="bold",
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+    else:
+        plt.tight_layout()
+
+    print_message("PLOT", "Opening visualization window. Close it to exit the script.")
     plt.show()
 
 
 # =====================================================================
-# MAIN EXECUTION
+# Main execution
 # =====================================================================
-# Complete attack pipeline: Craft poison → Deploy poison → Train victim → Evaluate
 if __name__ == "__main__":
-    # Select best available device (GPU > MPS > CPU)
+    # Fix random seeds to make the experiment reproducible across runs.
+    torch.manual_seed(42)
+    np.random.seed(42)
+
     device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
         else "cpu"
     )
-    print(f"Hardware Accelerator: {device.type.upper()}")
+    print_section("Experiment configuration")
+    print_metric("hardware accelerator", device.type.upper())
 
-    # ─────────────────────────────────────────────────────────────────
-    # 1. ATTACKER PHASE: Craft the poison
-    # ─────────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PHASE 1: ATTACKER - Crafting Imperceptible Poison")
-    print("="*60)
-    
-    # Load one normal and one malignant image
-    x_base, x_target, transform = load_breastmnist_pair()
-    x_base, x_target = x_base.to(device), x_target.to(device)
-    
-    # Initialize surrogate model (mimics victim's architecture)
+    # Phase 1: construct a bounded poison image with the attacker surrogate.
+    print_section("Phase 1 | Attacker poison generation")
+
+    num_poison_instances = 15
+    x_bases, x_target, transform = load_breastmnist_attack_samples(
+        num_poison_bases=num_poison_instances,
+    )
+    x_bases, x_target = x_bases.to(device), x_target.to(device)
     surrogate = SurrogateModel(device).to(device)
 
-    # THE CORE ATTACK: Generate poison via feature-space collision
-    epsilon_bound = 8 / 255  # Reduced for imperceptibility
-    x_poison = shafahi_feature_collision(
-        surrogate, x_base, x_target, epsilon=epsilon_bound
+    # The epsilon bound limits the maximum pixel-level perturbation.
+    epsilon_bound = 16 / 255
+    x_poisons = shafahi_feature_collision(
+        surrogate,
+        x_bases,
+        x_target,
+        epsilon=epsilon_bound,
+        steps=500,
     )
 
-    # Verify imperceptibility: poison should be visually indistinguishable
-    l_inf_norm = torch.max(torch.abs(x_poison - x_base)).item()
-    print(
-        f"  -> Mathematical Verification: Max Perturbation = {l_inf_norm:.4f} (Allowed: {epsilon_bound:.4f})"
-    )
+    l_inf_norm = torch.max(torch.abs(x_poisons - x_bases)).item()
+    print_message("VERIFY", "Perturbation bound check completed.")
+    print_metric("observed L-inf norm", f"{l_inf_norm:.4f}")
+    print_metric("allowed L-inf norm", f"{epsilon_bound:.4f}")
 
-    # ─────────────────────────────────────────────────────────────────
-    # 2. DEPLOYMENT PHASE: Prepare poisoned dataset
-    # ─────────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PHASE 2: DEPLOYMENT - Injecting Poison into Training Data")
-    print("="*60)
-    
-    # Load victim's training and test datasets
+    # Phase 2: insert clean-label poison samples into the victim's training set.
+    print_section("Phase 2 | Poison deployment")
+
     train_dataset_clean = medmnist.BreastMNIST(
-        split="train", download=False, transform=transform
+        split="train",
+        download=False,
+        transform=transform,
     )
     test_dataset_clean = medmnist.BreastMNIST(
-        split="test", download=False, transform=transform
+        split="test",
+        download=False,
+        transform=transform,
     )
 
-    #Inject poison with CLEAN LABEL (labeled as Normal, but corrupted)
+    # Diverse poison samples improve coverage around the target in feature space.
     poisoned_dataset = prepare_poisoned_dataset(
-        train_dataset_clean, x_poison, poison_label=1, copies=5
+        train_dataset_clean,
+        x_poisons,
+        poison_label=1,
     )
     train_loader = DataLoader(poisoned_dataset, batch_size=32, shuffle=True)
 
-    # ─────────────────────────────────────────────────────────────────
-    # 3. VICTIM TRAINING PHASE: Train on poisoned data unknowingly
-    # ─────────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PHASE 3: VICTIM - Training on Poisoned Dataset")
-    print("="*60)
-    
-    victim_model, norm_fn = train_victim_model(train_loader, device, epochs=10)
-    
-    # ─────────────────────────────────────────────────────────────────
-    # 4. EVALUATION PHASE: Measure attack success
-    # ─────────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PHASE 4: EVALUATION - Measuring Attack Success")
-    print("="*60)
-    
-    evaluate_attack(victim_model, norm_fn, test_dataset_clean, x_target, device)
+    # Phase 3: train the victim model using the contaminated dataset.
+    print_section("Phase 3 | Victim model training")
 
-    # ─────────────────────────────────────────────────────────────────
-    # 5. VISUALIZATION: Show the attack visually
-    # ─────────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PHASE 5: VISUALIZATION - Attack Summary")
-    print("="*60)
-    
-    plot_academic_results(x_base, x_target, x_poison)
+    victim_model, norm_fn = train_victim_model(train_loader, device, epochs=10)
+
+    # Phase 4: evaluate general accuracy and target-specific misclassification.
+    final_prediction, success_ratio = evaluate_attack(
+        victim_model,
+        norm_fn,
+        test_dataset_clean,
+        x_target,
+        device,
+        success_trials=25,
+    )
+
+    # Phase 5: summarize the base, poison, perturbation, and target prediction.
+    print_section("Phase 5 | Visualization")
+
+    plot_academic_results(
+        x_bases[:1],
+        x_target,
+        x_poisons[:1],
+        final_prediction,
+        success_ratio=success_ratio,
+    )
