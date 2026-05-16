@@ -5,6 +5,14 @@ attack on BreastMNIST images. The project follows the feature-collision idea
 from Shafahi et al., "Poison Frogs! Targeted Clean-Label Poisoning Attacks",
 and applies it to a binary medical-image classification setting.
 
+## Disclaimer
+
+This repository contains working attack code and is provided strictly for
+educational and research purposes. Do not use it to attack, disrupt, or
+manipulate systems, datasets, models, or services without explicit permission.
+You are responsible for using this code legally, ethically, and only in
+authorized environments.
+
 The attack uses normal BreastMNIST samples as benign-looking poison bases and a
 malignant sample as the target image. The generated poison images keep the
 normal label, but their feature representations are optimized to move toward the
