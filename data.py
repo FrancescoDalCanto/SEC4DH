@@ -1,6 +1,7 @@
 """BreastMNIST loading and dataset preparation helpers."""
 
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 from torch.utils.data import TensorDataset
 import medmnist
@@ -48,7 +49,7 @@ def load_breastmnist_split(split, transform, download=False):
     return medmnist.BreastMNIST(split=split, download=download, transform=transform)
 
 
-def load_breastmnist_attack_samples(num_poison_bases=15):
+def load_breastmnist_attack_samples(num_poison_bases=15, feature_extractor=None, device=None):
     """
     Load benign bases and one malignant target from BreastMNIST.
 
@@ -57,6 +58,16 @@ def load_breastmnist_attack_samples(num_poison_bases=15):
     num_poison_bases : int, default 15
         Number of normal samples, labeled ``1`` in BreastMNIST, used as bases
         for poison generation.
+    feature_extractor : torch.nn.Module, optional
+        Frozen feature extractor used to rank Normal candidates by cosine
+        similarity to the target. When provided, the ``num_poison_bases``
+        most similar Normal samples are selected so that all bases start close
+        to the target in feature space and converge above the detection
+        threshold after optimization. When ``None``, the first
+        ``num_poison_bases`` Normal samples are used.
+    device : torch.device, optional
+        Device used for feature extraction. Required when
+        ``feature_extractor`` is provided.
 
     Returns
     -------
@@ -68,16 +79,30 @@ def load_breastmnist_attack_samples(num_poison_bases=15):
     transform = build_breastmnist_transform()
     dataset = load_breastmnist_split("train", transform=transform, download=True)
 
-    x_bases, x_target = [], None
+    all_normals, x_target = [], None
     for img, label in dataset:
-        if label[0] == 1 and len(x_bases) < num_poison_bases:  # 1 = Normal
-            x_bases.append(img)
-        elif label[0] == 0 and x_target is None:  # 0 = Malignant
+        if label[0] == 1:
+            all_normals.append(img)
+        elif label[0] == 0 and x_target is None:
             x_target = img.unsqueeze(0)
-        if len(x_bases) == num_poison_bases and x_target is not None:
-            break
 
-    x_bases = torch.stack(x_bases)
+    if feature_extractor is not None and device is not None:
+        # Rank all Normal candidates by cosine similarity to the target and
+        # keep the top-num_poison_bases. Bases already close to the target
+        # in feature space will converge above the detection threshold after
+        # the epsilon-bounded optimization, making all poisons detectable.
+        normals_tensor = torch.stack(all_normals).to(device)
+        with torch.no_grad():
+            t_feat = F.normalize(feature_extractor(x_target.to(device)), dim=1)
+            sims = []
+            for i in range(0, len(normals_tensor), 32):
+                b_feat = F.normalize(feature_extractor(normals_tensor[i:i + 32]), dim=1)
+                sims.append((b_feat * t_feat).sum(dim=1))
+            sims = torch.cat(sims)
+            top_idx = sims.topk(num_poison_bases).indices.cpu()
+        x_bases = torch.stack(all_normals)[top_idx]
+    else:
+        x_bases = torch.stack(all_normals[:num_poison_bases])
 
     print_message("DATA", "Selected BreastMNIST samples for the attack.")
     print_metric(

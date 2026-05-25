@@ -61,14 +61,16 @@ if __name__ == "__main__":
     print_section("Phase 1 | Attacker poison generation")
 
     num_poison_instances = 20
+    feature_extractor = FrozenResNetFeatureExtractor(device).to(device)
     x_bases, x_target, transform = load_breastmnist_attack_samples(
         num_poison_bases=num_poison_instances,
+        feature_extractor=feature_extractor,
+        device=device,
     )
     x_bases, x_target = x_bases.to(device), x_target.to(device)
-    feature_extractor = FrozenResNetFeatureExtractor(device).to(device)
 
     # The epsilon bound controls the maximum pixel-level perturbation.
-    epsilon_bound = 4 / 255
+    epsilon_bound = 8 / 255
     x_poisons = generate_feature_collision_poisons(
         feature_extractor,
         x_bases,
@@ -115,7 +117,7 @@ if __name__ == "__main__":
             x_target,
             device,
             suspect_label=1,
-            similarity_threshold=0.70,
+            similarity_threshold=0.95,
         )
         train_loader = DataLoader(sanitized_dataset, batch_size=32, shuffle=True)
     else:
