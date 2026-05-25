@@ -115,7 +115,7 @@ if __name__ == "__main__":
             x_target,
             device,
             suspect_label=1,
-            similarity_threshold=0.90,
+            similarity_threshold=0.70,
         )
         train_loader = DataLoader(sanitized_dataset, batch_size=32, shuffle=True)
     else:
@@ -155,4 +155,5 @@ if __name__ == "__main__":
         success_ratio=success_ratio,
         output_path="imgs/attack_evaluation_summary.png",
     )
+
 
