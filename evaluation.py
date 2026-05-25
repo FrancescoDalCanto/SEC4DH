@@ -78,6 +78,9 @@ def evaluate_attack(
     )
     print_metric("confidence normal", f"{norm_prob:.1f}%")
     print_metric("confidence malignant", f"{mal_prob:.1f}%")
+    if defense_active:
+        target_attack_success = "yes" if pred_int == 1 else "no"
+        print_metric("target attack success after defense", target_attack_success)
 
     # Estimate whether the poisoning effect transfers to other malignant samples.
     success_count = 0
@@ -110,10 +113,20 @@ def evaluate_attack(
     print_message("EVAL", "Repeated malignant-sample prediction test.")
     print_metric("samples evaluated", total_trials)
     print_metric("misclassified as Normal", success_count)
-    print_metric("attack success ratio", f"{success_ratio:.2f}%")
+    asr_label = (
+        "malignant-to-Normal rate after defense"
+        if defense_active
+        else "attack success ratio"
+    )
+    print_metric(asr_label, f"{success_ratio:.2f}%")
     print_metric("average Normal confidence", f"{average_normal_confidence:.1f}%")
 
-    if pred_int == 1:
+    if defense_active and pred_int == 1:
+        print_message(
+            "RESULT",
+            "Defense failed: the target is still classified as Normal after sanitization.",
+        )
+    elif pred_int == 1:
         print_message(
             "RESULT",
             "Attack successful: the malignant target was classified as Normal.",
