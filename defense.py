@@ -52,36 +52,35 @@ def detect_and_remove_poisons(
     """
     print_section(section_header)
 
-    # Unpack tensors from the dataset for sequential sample-by-sample inspection.
+    # Extract tensors from the dataset for per-sample inspection.
     images, labels = dataset.tensors
     feature_extractor.eval()
 
-    # Compute and normalize the target feature vector once; it serves as the fixed
-    # reference point for all cosine similarity comparisons below.
+    # Compute and normalize the target feature vector once; use it as the fixed
+    # reference for all cosine similarity comparisons below.
     with torch.no_grad():
         target_feat = feature_extractor(x_target.to(device))
         target_feat = F.normalize(target_feat, dim=1)
 
     kept_images, kept_labels = [], []
     flagged = 0
-    suspect_similarities = []  # Collected for diagnostic reporting only.
+    suspect_similarities = []  # Retained only for diagnostic reporting.
 
     with torch.no_grad():
         for img, label in zip(images, labels):
-            # Only samples carrying the suspect label need inspection; all other
-            # classes are kept unconditionally because the attacker only injects
-            # poisons under the poison label.
+            # Inspect only samples with the suspect label; other classes are kept
+            # unconditionally because poisons are injected under the poison label.
             if int(label.item()) == suspect_label:
                 feat = feature_extractor(img.unsqueeze(0).to(device))
                 feat = F.normalize(feat, dim=1)
 
-                # Dot product of two unit vectors equals their cosine similarity.
+                # The dot product of unit vectors equals cosine similarity.
                 sim = (feat * target_feat).sum().item()
                 suspect_similarities.append(sim)
 
-                # Feature-collision poisons sit very close to the target in feature
-                # space (by construction); legitimate samples do not — drop the sample
-                # if its similarity exceeds the threshold.
+                # Feature-collision poisons lie near the target in feature space;
+                # legitimate samples do not. Drop the sample if its similarity
+                # exceeds the threshold.
                 if sim >= similarity_threshold:
                     flagged += 1
                     continue
