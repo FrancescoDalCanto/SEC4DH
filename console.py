@@ -28,7 +28,7 @@ def print_message(scope, message):
     message : str
         Message describing the current action or result.
     """
-    print(f"[{scope:<10}] {message}")
+    print(f"[  {scope}  ] {message}")
 
 
 def print_metric(label, value):

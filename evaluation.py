@@ -14,6 +14,8 @@ def evaluate_attack(
     x_target,
     device,
     success_trials=25,
+    section_header="Phase 4 | Evaluation and attack outcome",
+    defense_active=False,
 ):
     """
     Evaluate clean accuracy and attack success after poisoning.
@@ -40,7 +42,7 @@ def evaluate_attack(
         Predicted class for ``x_target`` and percentage of malignant trial
         samples classified as normal.
     """
-    print_section("Phase 4 | Evaluation and attack outcome")
+    print_section(section_header)
 
     # Standard test accuracy is used as a simple proxy for attack stealth.
     correct, total = 0, 0
@@ -115,6 +117,11 @@ def evaluate_attack(
         print_message(
             "RESULT",
             "Attack successful: the malignant target was classified as Normal.",
+        )
+    elif defense_active:
+        print_message(
+            "RESULT",
+            "Defense effective: poison samples removed before training — attack neutralized.",
         )
     else:
         print_message(

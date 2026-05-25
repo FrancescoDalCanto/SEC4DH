@@ -69,10 +69,7 @@ def train_victim_model(train_loader, device, epochs=10):
             optimizer.step()
             running_loss += loss.item()
 
-        print(
-            f"[TRAIN     ] Epoch {epoch + 1:02d}/{epochs} | "
-            f"average loss: {running_loss / len(train_loader):.4f}"
-        )
+        print(f"[  TRAIN  ] Epoch {epoch + 1:02d}/{epochs} | average loss: {running_loss / len(train_loader):.4f}")
 
     victim_model.eval()
     return victim_model, normalize

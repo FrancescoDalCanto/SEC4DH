@@ -86,9 +86,6 @@ def generate_feature_collision_poisons(
             x_poison.copy_(torch.clamp(x_base + delta, min=0.0, max=1.0))
 
         if (step + 1) % 100 == 0 or step == 0:
-            print(
-                f"[ATTACK    ] Step {step + 1:03d}/{steps} | "
-                f"feature MSE: {loss.item():.4f}"
-            )
+            print(f"[  ATTACK  ] Step {step + 1:03d}/{steps} | feature MSE: {loss.item():.4f}")
 
     return x_poison.detach()

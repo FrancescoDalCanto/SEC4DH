@@ -7,6 +7,7 @@ training images whose feature representations move toward a malignant target
 image, then measures the effect on a transfer-learning classifier.
 """
 
+import argparse
 import warnings
 
 import torch
@@ -18,6 +19,7 @@ from data import (
     load_breastmnist_split,
     prepare_poisoned_dataset,
 )
+from defense import detect_and_remove_poisons
 from evaluation import evaluate_attack
 from features import FrozenResNetFeatureExtractor
 from poisoning import generate_feature_collision_poisons
@@ -30,6 +32,14 @@ warnings.filterwarnings("ignore")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Clean-label poisoning experiment.")
+    parser.add_argument(
+        "--defense",
+        action="store_true",
+        help="Enable feature-space poison detection before training.",
+    )
+    args = parser.parse_args()
+
     # Uncomment these seeds when deterministic sample selection is required.
     # torch.manual_seed(42)
     # np.random.seed(42)
@@ -44,7 +54,7 @@ if __name__ == "__main__":
     print_section("Experiment configuration")
     print_metric("hardware accelerator", device.type.upper())
 
-    # Phase 1: craft bounded poison samples with the attacker feature extractor.
+    # craft bounded poison samples with the attacker feature extractor.
     print_section("Phase 1 | Attacker poison generation")
 
     num_poison_instances = 20
@@ -70,7 +80,7 @@ if __name__ == "__main__":
     print_metric("observed L-inf norm", f"{l_inf_norm:.4f}")
     print_metric("allowed L-inf norm", f"{epsilon_bound:.4f}")
 
-    # Phase 2: insert clean-label poisons into the victim's training set.
+    # Iinsert clean-label poisons into the victim's training set.
     print_section("Phase 2 | Poison deployment")
 
     train_dataset_clean = load_breastmnist_split(
@@ -90,14 +100,25 @@ if __name__ == "__main__":
         x_poisons,
         poison_label=1,
     )
-    train_loader = DataLoader(poisoned_dataset, batch_size=32, shuffle=True)
+    if args.defense:
+        sanitized_dataset = detect_and_remove_poisons(
+            poisoned_dataset,
+            feature_extractor,
+            x_target,
+            device,
+            suspect_label=1,
+            similarity_threshold=0.90,
+        )
+        train_loader = DataLoader(sanitized_dataset, batch_size=32, shuffle=True)
+    else:
+        train_loader = DataLoader(poisoned_dataset, batch_size=32, shuffle=True)
 
-    # Phase 3: train the victim model on the contaminated dataset.
+    # Train the victim model on the sanitized dataset.
     print_section("Phase 3 | Victim model training")
 
     victim_model, norm_fn = train_victim_model(train_loader, device, epochs=10)
 
-    # Phase 4: measure clean accuracy and target-specific misclassification.
+    # Measure clean accuracy and target-specific misclassification.
     final_prediction, success_ratio = evaluate_attack(
         victim_model,
         norm_fn,
@@ -105,9 +126,11 @@ if __name__ == "__main__":
         x_target,
         device,
         success_trials=25,
+        section_header="Phase 4 | Evaluation and attack outcome",
+        defense_active=args.defense,
     )
 
-    # Phase 5: visualize the base, poison, perturbation, and target prediction.
+    # Visualize the base, poison, perturbation, and target prediction.
     print_section("Phase 5 | Visualization")
 
     save_images_singly(x_bases[:1], "imgs", prefix="base")
@@ -120,4 +143,6 @@ if __name__ == "__main__":
         x_poisons[:1],
         final_prediction,
         success_ratio=success_ratio,
+        output_path="imgs/attack_evaluation_summary.png",
     )
+
