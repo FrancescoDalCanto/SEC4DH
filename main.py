@@ -117,7 +117,7 @@ if __name__ == "__main__":
             x_target,
             device,
             suspect_label=1,
-            similarity_threshold=0.95,
+            similarity_threshold=0.70,
         )
         train_loader = DataLoader(sanitized_dataset, batch_size=32, shuffle=True)
     else:

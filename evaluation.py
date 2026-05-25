@@ -44,22 +44,6 @@ def evaluate_attack(
     """
     print_section(section_header)
 
-    # Standard test accuracy is used as a simple proxy for attack stealth.
-    correct, total = 0, 0
-    with torch.no_grad():
-        for img, label in test_dataset:
-            img = normalize(img.unsqueeze(0).to(device))
-            output = victim_model(img)
-            _, predicted = torch.max(output.data, 1)
-            total += 1
-            if predicted.item() == label[0]:
-                correct += 1
-
-    clean_acc = 100 * correct / total
-    print_message("EVAL", "Stealth metric: clean test-set performance.")
-    print_metric("overall test accuracy", f"{clean_acc:.2f}%")
-    print_metric("interpretation", "model performance remains plausible")
-
     # Evaluate the specific target image used during poison generation.
     with torch.no_grad():
         target_input = normalize(x_target.to(device))
