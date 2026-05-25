@@ -33,6 +33,9 @@ warnings.filterwarnings("ignore")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Clean-label poisoning experiment.")
+    # When passed, the defense sanitizes the poisoned training set before the
+    # victim is trained, allowing a direct comparison of attack success with and
+    # without the countermeasure.
     parser.add_argument(
         "--defense",
         action="store_true",
@@ -100,6 +103,11 @@ if __name__ == "__main__":
         x_poisons,
         poison_label=1,
     )
+    # Phase 2b (optional): remove suspected poisons before handing the dataset
+    # to the victim. The same feature extractor used by the attacker is reused
+    # here because the defense exploits the attacker's own objective — poisons
+    # designed to collide with the target in feature space will also be detected
+    # by measuring cosine similarity in that same space.
     if args.defense:
         sanitized_dataset = detect_and_remove_poisons(
             poisoned_dataset,
@@ -111,9 +119,11 @@ if __name__ == "__main__":
         )
         train_loader = DataLoader(sanitized_dataset, batch_size=32, shuffle=True)
     else:
+        # No defense: train directly on the poisoned dataset to measure the
+        # full attack impact as the baseline.
         train_loader = DataLoader(poisoned_dataset, batch_size=32, shuffle=True)
 
-    # Train the victim model on the sanitized dataset.
+    # Train the victim model on the (optionally sanitized) dataset.
     print_section("Phase 3 | Victim model training")
 
     victim_model, norm_fn = train_victim_model(train_loader, device, epochs=10)
